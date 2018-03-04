@@ -8,6 +8,8 @@ from sklearn.metrics import mean_squared_error
 from keras.models import Sequential
 from keras.layers import Dense, LSTM
 
+weather_grouped = pickle.load(open('weather_grouped.p', 'rb'))
+holidays = pickle.load(open('holidays.p', 'rb'))
 
 def RMSLE(y, pred):
     return mean_squared_error(y, pred)**0.5
@@ -33,8 +35,8 @@ def series_to_supervised(data, n_in=1, n_out=1, dropnan=True):
     agg = pd.concat(cols, axis=1)
     agg.columns = names
     # drop rows with NaN values
-    if dropnan:
-        agg.dropna(inplace=True)
+#     if dropnan:
+#         agg.dropna(inplace=True)
     return agg
 
 
@@ -48,8 +50,7 @@ def reframe_features(data=None, n_in=1):
     scaled = scaler.fit_transform(values)
     # frame as supervised learning
     reframed = series_to_supervised(scaled, n_in, 1)
-    reframed.drop(reframed.columns[[reframed.shape[1] - i for i in range(1,data.shape[1])]], 
-        axis=1, inplace=True)
+    reframed.drop(reframed.columns[[reframed.shape[1] - i for i in range(1,data.shape[1])]], axis=1, inplace=True)
     print(reframed.head())
     return reframed, scaler
 
@@ -66,15 +67,37 @@ def load_site(train=None, test=None, site_id=None, weather=weather_grouped, holi
     data.drop(['Unnamed: 0_x','Unnamed: 0_y'], axis=1, inplace=True)
     return data
 
+# find start and end times for site
+def find_start_end(data):
+    time_pairs = []
+    forecast_ids = data.ForecastId.unique()[1:]
+    forecast_length = data[data.ForecastId==forecast_ids[0]].shape[0]-1
+    timedelta = data.Timestamp[1] - data.Timestamp[0]
+    train_start = data.Timestamp[0]
+    test_end = data[data.ForecastId==forecast_ids[0]].Timestamp[forecast_length]
+    test_start = test_end - forecast_length*timedelta
+    train_end = test_start - timedelta
+    time_pairs.append((train_start, train_end, test_start, test_end))
+    
+    for forecast_id in forecast_ids[1:]:
+        forecast_length = data[data.ForecastId==forecast_id].shape[0]-1
+        train_start = test_end + timedelta
+        test_end = data[data.ForecastId==forecast_id].Timestamp[forecast_length]
+        test_start = test_end - forecast_length*timedelta
+        train_end = test_start - timedelta
+        time_pairs.append((train_start, train_end, test_start, test_end))
+    
+    return time_pairs
+
 # segment and interpolate data for site
 def prepare_data(data=None, features= ['Value', 'Temperature'], method='linear'):
     data.index = data.Timestamp
     data = data[features]
+    data['Temperature'].interpolate(method, inplace=True)
     try:
         # start where there isn't consecutive NaNs
         start_index = data[(data.Temperature.isnull()==False)&(data.Temperature.shift(-1).isnull()==False)].index[0]
         data = data.loc[start_index:,:]
-        data['Temperature'].interpolate(method, inplace=True)
     except:
         print('No temperature data')
     return data
@@ -87,6 +110,7 @@ def split_train_test(reframed, n_train_days):
     # Split into input and outputs
     train_X, train_y = train[:, :-1], train[:, -1]
     test_X, test_y = test[:, :-1], test[:, -1]
+    print(train_X.shape, train_y.shape, test_X.shape, test_y.shape)
     # Reshape input to be 3D [samples, timesteps, features]
     train_X = train_X.reshape((train_X.shape[0], 1, train_X.shape[1]))
     test_X = test_X.reshape((test_X.shape[0], 1, test_X.shape[1]))
@@ -113,34 +137,32 @@ def model_predict(model, test_X, n_features, scaler):
     inv_yhat = scaler.inverse_transform(inv_yhat)[:,0]
     return inv_yhat
 
+#adds prediction to proper submission format
+def predict_site(train=None, test=None, site_id=None):
+    #load site data and train/test times
+    data = load_site(train, test, site_id)
+    data.sort_values('Timestamp', inplace=True)
+    data.index = data.Timestamp
+    data = prepare_data(data, features=['Value', 'Temperature','isHoliday','ForecastId','Timestamp'])
+    time_pairs = find_start_end(data)
+    
+    #build model and predict for each forecastid
+    for n, times in enumerate(time_pairs):
+        df = data[(data.Timestamp >= time_pairs[n][0]) & (data.Timestamp <= time_pairs[n][3])]
+        df = prepare_data(df, features=['Value','Temperature','isHoliday','ForecastId'])
+        df['Temperature'].fillna(0, inplace=True)
+        df.loc[:,'Timestamp'] = df.index
+        df.drop(['ForecastId','Timestamp'],axis=1, inplace=True)
+        n_train_days = df[(df.index >=time_pairs[n][0]) & (df.index <=time_pairs[n][1])].shape[0]-1
+        n_features = df.shape[1]
+        reframed_data, scaler = reframe_features(df, 2)
+        reframed_data.fillna(0, inplace=True)
+        train_X, train_y, test_X, test_y = split_train_test(reframed_data, n_train_days)
+        model = create_LSTM(train_X, train_y, epochs=50)
+        inv_yhat = model_predict(model, test_X, n_features, scaler)
+        data.loc[time_pairs[n][2]:time_pairs[n][3], 'Value'] = inv_yhat
+        
+    return data
 
-if __name__ == '__main__':
 
-	# load data
-	submission_frequency = pickle.load(open('submission_frequency.p', 'rb'))
-	metadata = pickle.load(open('metadata.p', 'rb'))
-    holidays = pickle.load(open('holidays.p', 'rb'))
-    weather_grouped = pickle.load(open('weather_grouped.p', 'rb'))
-    train = pickle.load(open('train.p', 'rb'))
-    submission_format = pickle.load(open('submission_format.p', 'rb'))
-
-	# prepare data for model
-	df = load_site(train, submission_format, 1)
-    df = prepare_data(df, features=['Value','Temperature','isHoliday'])
-    n_train_days = train[train.SiteId==1].shape[0]-1
-    n_features = df.shape[1]
-    reframed_data, scaler = reframe_features(df, 2)
-    train_X, train_y, test_X, test_y = split_train_test(reframed_data, n_train_days)
-
-    #build model and predict
-    lstm_model = create_LSTM(train_X, train_y, epochs=50)
-    inv_yhat = model_predict()
-
-	df1 = get_site_data(df, 1, ['Value','Temperature','isHoliday'])
-	df1['Temperature'].interpolate('linear', inplace=True)
-	reframed_data = reframe_features(df1, 1)
-	train_X, train_y, test_X, test_y = split_train_test(reframed_data)
-	multi_model = create_LSTM(train_X, train_y, test_X, test_y)
-	yhat = multi_model.predict(test_X)
-	print(yhat)
 
